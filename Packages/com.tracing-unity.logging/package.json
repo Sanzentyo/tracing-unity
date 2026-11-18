@@ -1,0 +1,8 @@
+{
+  "name": "com.tracing-unity.logging",
+  "version": "0.1.0",
+  "displayName": "Tracing Unity",
+  "description": "Bounded main-thread delivery of native tracing records to Unity logging.",
+  "unity": "6000.3",
+  "license": "MIT OR Apache-2.0"
+}

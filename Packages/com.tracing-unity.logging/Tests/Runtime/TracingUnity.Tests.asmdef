@@ -1,0 +1,6 @@
+{
+ "name":"TracingUnity.Tests",
+ "references":["TracingUnity"],
+ "optionalUnityReferences":["TestAssemblies"],
+ "includePlatforms":["Editor"]
+}

@@ -1,0 +1,7 @@
+/target/
+/Artifacts/
+/Logs/
+*.pdb
+*.dll
+*.exe
+.DS_Store

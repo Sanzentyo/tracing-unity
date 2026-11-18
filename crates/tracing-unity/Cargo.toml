@@ -1,0 +1,13 @@
+[package]
+name = "tracing-unity"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Composable tracing events with bounded polling and asynchronous output"
+repository = "https://github.com/Sanzentyo/tracing-unity"
+readme = "../../README.md"
+
+[dependencies]
+tracing = { version = "0.1.44", default-features = false, features = ["std"] }
+tracing-subscriber = { version = "0.3.23", default-features = false, features = ["registry", "std"] }
