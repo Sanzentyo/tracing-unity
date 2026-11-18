@@ -16,7 +16,7 @@ use std::{
     path::PathBuf,
     sync::{
         Arc, Condvar, Mutex, OnceLock,
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicU8, AtomicU64, Ordering},
     },
     thread::{self, JoinHandle},
 };
@@ -68,7 +68,10 @@ pub struct Config {
     pub poll_enabled: bool,
     pub poll_capacity: usize,
     pub file_capacity: usize,
+    /// File/stderr threshold and the initial polling threshold when no override is set.
     pub max_level: Level,
+    /// Optional initial polling-only override. None preserves `max_level` behavior.
+    pub poll_max_level: Option<Level>,
 }
 impl Default for Config {
     fn default() -> Self {
@@ -79,14 +82,15 @@ impl Default for Config {
             poll_capacity: 256,
             file_capacity: 1024,
             max_level: Level::INFO,
+            poll_max_level: None,
         }
     }
 }
 #[derive(Debug, Clone, Copy, Default)]
 pub struct Stats {
-    /// Records rejected by an enabled polling sink, including after closure.
+    /// Threshold-eligible records rejected by polling, including after closure.
     pub poll_dropped: u64,
-    /// Records rejected by an enabled output sink, including after closure.
+    /// Threshold-eligible records rejected by output, including after closure.
     pub file_dropped: u64,
     pub format_failed: u64,
     pub file_errors: u64,
@@ -95,6 +99,11 @@ pub struct Stats {
 pub enum DrainError {
     BufferTooSmall { required: usize },
     Busy,
+    Poisoned,
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SetLevelError {
+    Closed,
     Poisoned,
 }
 struct Queues {
@@ -109,6 +118,8 @@ struct Shared {
     file_capacity: usize,
     file_enabled: bool,
     poll_enabled: bool,
+    poll_max_level: AtomicU8,
+    file_max_level: Level,
     poll_dropped: AtomicU64,
     file_dropped: AtomicU64,
     format_failed: AtomicU64,
@@ -124,22 +135,24 @@ impl Shared {
         }
     }
     fn enqueue(&self, record: Record) {
+        let file_accept = self.file_enabled
+            && record.level as u32 <= RecordLevel::from(&self.file_max_level) as u32;
         // Allocate outside the shared queue lock, keeping writer/consumer contention brief.
-        let file_record = self.file_enabled.then(|| record.clone());
+        let file_record = file_accept.then(|| record.clone());
         let Ok(mut q) = self.queues.try_lock() else {
-            if self.poll_enabled {
+            if self.poll_accept(record.level) {
                 self.poll_dropped.fetch_add(1, Ordering::Relaxed);
             }
-            if self.file_enabled {
+            if file_accept {
                 self.file_dropped.fetch_add(1, Ordering::Relaxed);
             }
             return;
         };
         if !q.active {
-            if self.poll_enabled {
+            if self.poll_accept(record.level) {
                 self.poll_dropped.fetch_add(1, Ordering::Relaxed);
             }
-            if self.file_enabled {
+            if file_accept {
                 self.file_dropped.fetch_add(1, Ordering::Relaxed);
             }
             return;
@@ -152,7 +165,7 @@ impl Shared {
                 self.file_dropped.fetch_add(1, Ordering::Relaxed);
             }
         }
-        if !self.poll_enabled {
+        if !self.poll_accept(record.level) {
             return;
         }
         if q.poll.len() < self.poll_capacity {
@@ -161,16 +174,45 @@ impl Shared {
             self.poll_dropped.fetch_add(1, Ordering::Relaxed);
         }
     }
+    fn poll_accept(&self, level: RecordLevel) -> bool {
+        self.poll_enabled && level as u8 <= self.poll_max_level.load(Ordering::Relaxed)
+    }
 }
 /// Composable event sink. Obtain one from [`Runtime::layer`].
 /// Its level limit only affects this sink, never sibling layers.
 pub struct EventLayer {
     shared: Arc<Shared>,
-    max_level: Level,
+}
+// Only the private convenience subscriber, with no sibling sinks, uses this
+// subscriber-wide gate. Never add unrelated sinks to that subscriber. A bare EventLayer must not
+// suppress spans/events needed by sibling layers on a host-owned subscriber.
+struct EventFilter(Arc<Shared>);
+impl<S: Subscriber> Layer<S> for EventFilter {
+    fn enabled(&self, metadata: &tracing::Metadata<'_>, _: Context<'_, S>) -> bool {
+        metadata.is_event()
+            && (self.0.poll_accept(metadata.level().into())
+                || (self.0.file_enabled && *metadata.level() <= self.0.file_max_level))
+    }
+    fn register_callsite(
+        &self,
+        metadata: &'static tracing::Metadata<'static>,
+    ) -> tracing::subscriber::Interest {
+        if metadata.is_span() {
+            tracing::subscriber::Interest::never()
+        } else {
+            tracing::subscriber::Interest::sometimes()
+        }
+    }
+    fn max_level_hint(&self) -> Option<tracing::metadata::LevelFilter> {
+        Some(tracing::metadata::LevelFilter::TRACE)
+    }
 }
 impl<S: Subscriber> Layer<S> for EventLayer {
     fn on_event(&self, event: &Event<'_>, _ctx: Context<'_, S>) {
-        if *event.metadata().level() > self.max_level {
+        if !self.shared.poll_accept(event.metadata().level().into())
+            && !(self.shared.file_enabled
+                && *event.metadata().level() <= self.shared.file_max_level)
+        {
             return;
         }
         let formatted = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -246,7 +288,6 @@ pub struct Runtime {
     shared: Arc<Shared>,
     dispatch: OnceLock<Dispatch>,
     writer: Option<JoinHandle<io::Result<()>>>,
-    max_level: Level,
 }
 impl Runtime {
     /// Opens the optional sink once. Invalid path or thread spawn fails explicitly; callers
@@ -279,6 +320,10 @@ impl Runtime {
             file_capacity: config.file_capacity,
             file_enabled: sink.is_some(),
             poll_enabled: config.poll_enabled,
+            poll_max_level: AtomicU8::new(RecordLevel::from(
+                &config.poll_max_level.unwrap_or(config.max_level),
+            ) as u8),
+            file_max_level: config.max_level,
             poll_dropped: AtomicU64::new(0),
             file_dropped: AtomicU64::new(0),
             format_failed: AtomicU64::new(0),
@@ -298,7 +343,6 @@ impl Runtime {
             shared,
             dispatch: OnceLock::new(),
             writer,
-            max_level: config.max_level,
         })
     }
     /// Creates a layer for a host-owned subscriber. Keep this owner alive until
@@ -306,24 +350,56 @@ impl Runtime {
     pub fn layer(&self) -> EventLayer {
         EventLayer {
             shared: self.shared.clone(),
-            max_level: self.max_level,
         }
     }
     /// Convenience dispatch, never installed globally or on any thread by this crate.
     /// Lazily constructed: layer-only use does not register an extra dispatch.
+    /// Its private subscriber rejects spans and checks event levels before evaluating
+    /// fields. It contains no unrelated sibling sinks; use `layer()` for composition.
     pub fn dispatch(&self) -> Dispatch {
         self.dispatch
             .get_or_init(|| {
                 Dispatch::new(
-                    tracing_subscriber::registry().with(self.layer().with_filter(
-                        tracing_subscriber::filter::LevelFilter::from_level(self.max_level),
-                    )),
+                    tracing_subscriber::registry()
+                        .with(self.layer())
+                        .with(EventFilter(self.shared.clone())),
                 )
             })
             .clone()
     }
     pub fn stats(&self) -> Stats {
         self.shared.stats()
+    }
+    /// Changes only future polling admission. Already queued records are retained.
+    /// Serialized with queue admission and closure; never changes file or sibling layers.
+    /// The host must not impose a stricter static filter if runtime increases are needed.
+    /// This control-plane call may wait for the queue mutex; do not call from a formatter.
+    /// In-flight events can be filtered before a concurrent increase, or at admission
+    /// after a decrease. The setter does not replay events or purge the existing queue.
+    pub fn set_poll_max_level(&self, level: Level) -> Result<(), SetLevelError> {
+        let q = self
+            .shared
+            .queues
+            .lock()
+            .map_err(|_| SetLevelError::Poisoned)?;
+        if !q.active {
+            return Err(SetLevelError::Closed);
+        }
+        self.shared
+            .poll_max_level
+            .store(RecordLevel::from(&level) as u8, Ordering::Relaxed);
+        Ok(())
+    }
+    /// Current polling threshold, also readable after shutdown.
+    pub fn poll_max_level(&self) -> Level {
+        match self.shared.poll_max_level.load(Ordering::Relaxed) {
+            1 => Level::ERROR,
+            2 => Level::WARN,
+            3 => Level::INFO,
+            4 => Level::DEBUG,
+            5 => Level::TRACE,
+            _ => unreachable!("poll level is initialized and changed only from typed Level"),
+        }
     }
     /// Pops only if capacity covers target+message UTF-8 bytes; no header/NUL is counted.
     /// Zero capacity is always a non-consuming query, even for an empty record.
@@ -549,8 +625,8 @@ mod tests {
         let convenience = runtime.dispatch();
         assert!(runtime.dispatch.get().is_some());
         tracing::dispatcher::with_default(&convenience, || {
-            assert!(!tracing::enabled!(Level::DEBUG));
-            assert!(tracing::enabled!(Level::INFO));
+            assert!(!tracing::event_enabled!(Level::DEBUG));
+            assert!(tracing::event_enabled!(Level::INFO));
         });
     }
     #[test]
@@ -571,6 +647,69 @@ mod tests {
                 assert!(runtime.drain_record(4096).unwrap().is_none());
             }
         }
+    }
+    #[test]
+    fn poll_level_change_rejects_closure_and_poison() {
+        let runtime = runtime(4);
+        let state = runtime.shared.clone();
+        let (held, wait) = std::sync::mpsc::channel();
+        thread::scope(|scope| {
+            scope.spawn(move || {
+                let mut q = state.queues.lock().unwrap();
+                held.send(()).unwrap();
+                q.active = false;
+            });
+            wait.recv().unwrap();
+            assert_eq!(
+                runtime.set_poll_max_level(Level::TRACE),
+                Err(SetLevelError::Closed)
+            );
+        });
+        assert_eq!(runtime.poll_max_level(), Level::INFO);
+        let state = runtime.shared.clone();
+        let _ = thread::spawn(move || {
+            let _guard = state.queues.lock().unwrap();
+            panic!("poison queue for error-path test");
+        })
+        .join();
+        assert_eq!(
+            runtime.set_poll_max_level(Level::DEBUG),
+            Err(SetLevelError::Poisoned)
+        );
+        assert_eq!(runtime.poll_max_level(), Level::INFO);
+    }
+    #[test]
+    fn dynamic_poll_filter_leaves_file_admission_unchanged() {
+        // Inspect sink admission without writer scheduling/try-lock contention.
+        let mut runtime = Runtime::new(Config::default()).unwrap();
+        Arc::get_mut(&mut runtime.shared).unwrap().file_enabled = true;
+        let dispatch = runtime.dispatch();
+        for level in [
+            Level::INFO,
+            Level::DEBUG,
+            Level::INFO,
+            Level::TRACE,
+            Level::ERROR,
+        ] {
+            runtime.set_poll_max_level(level).unwrap();
+            tracing::dispatcher::with_default(&dispatch, || {
+                tracing::error!("error");
+                tracing::warn!("warn");
+                tracing::info!("info");
+                tracing::debug!("debug");
+                tracing::trace!("trace");
+            });
+            let mut q = runtime.shared.queues.lock().unwrap();
+            let file: Vec<_> = q.file.drain(..).map(|r| r.level as u32).collect();
+            assert_eq!(file, vec![1, 2, 3]);
+            let poll: Vec<_> = q.poll.drain(..).map(|r| r.level as u32).collect();
+            assert_eq!(
+                poll,
+                (1..=RecordLevel::from(&level) as u32).collect::<Vec<_>>()
+            );
+        }
+        assert_eq!(runtime.stats().poll_dropped, 0);
+        assert_eq!(runtime.stats().file_dropped, 0);
     }
     #[test]
     fn level_filter_rejects_verbose_events() {

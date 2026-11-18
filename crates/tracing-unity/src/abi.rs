@@ -2,13 +2,38 @@
 //!
 //! The host owns the runtime, exported function names, initialization and shutdown.
 //! These helpers do not export symbols, store global state or transfer tracing types.
-use crate::{DrainError, Runtime};
+use crate::{DrainError, RecordLevel, Runtime, SetLevelError};
 
 pub const POLL_RECORD: i32 = 1;
 pub const POLL_EMPTY: i32 = 0;
 pub const POLL_INVALID: i32 = -1;
 pub const POLL_SHORT_BUFFER: i32 = -2;
 pub const POLL_BUSY: i32 = -3;
+pub const LEVEL_CLOSED: i32 = -4;
+
+/// Changes only polling admission: 1=error, 2=warn, 3=info, 4=debug, 5=trace.
+/// Returns 0 on success, -1 for invalid input/poisoned state, -4 after closure.
+/// Invalid input never changes the threshold. No foreign pointers are retained.
+pub fn set_poll_max_level(runtime: &Runtime, level: u32) -> i32 {
+    let level = match level {
+        1 => tracing::Level::ERROR,
+        2 => tracing::Level::WARN,
+        3 => tracing::Level::INFO,
+        4 => tracing::Level::DEBUG,
+        5 => tracing::Level::TRACE,
+        _ => return POLL_INVALID,
+    };
+    match runtime.set_poll_max_level(level) {
+        Ok(()) => 0,
+        Err(SetLevelError::Closed) => LEVEL_CLOSED,
+        Err(SetLevelError::Poisoned) => POLL_INVALID,
+    }
+}
+
+/// Returns the current polling threshold as 1..=5, including after shutdown.
+pub fn poll_max_level(runtime: &Runtime) -> u32 {
+    RecordLevel::from(&runtime.poll_max_level()) as u32
+}
 
 /// Header size is 16 bytes. Payload is target UTF-8 followed by message UTF-8,
 /// without NUL terminators. `level` is 1=error, 2=warn, 3=info, 4=debug, 5=trace.

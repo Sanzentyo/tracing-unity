@@ -28,9 +28,26 @@ The configuration accepts an explicit file path; it reads no application-specifi
 
 Install the package from this repository's `Packages/com.tracing-unity.logging` path using Unity Package Manager. For a Git dependency, pin a full reviewed commit and use `?path=/Packages/com.tracing-unity.logging#<commit>`.
 
-Implement `ILogSource.Poll` and `GetStats` as thin bindings to exports in your own plugin. On Unity's main thread, add a `LogPump`, then call `Attach(source)`. `LateUpdate` drains at most 32 records per invocation. Error and warning records retain their severity. Manual `Drain()` also has this limit and rejects reentrant calls; do not call it repeatedly to bypass the frame budget.
+Implement `ILogSource.Poll` and `GetStats` as thin bindings to exports in your own plugin. On Unity's main thread, add a `LogPump`, then call `Attach(source)`. `LateUpdate` drains at most 32 records per invocation. Error and warning records retain their severity. All Console messages include the original uppercase level label; Info, Debug and Trace use Unity Log. Manual `Drain()` also has this limit and rejects reentrant calls; do not call it repeatedly to bypass the frame budget.
 
 All pump APIs require Unity main-thread calls; Attach also requires a live active component. Destroyed or inactive pumps do not poll. The pump has no static registry and subscribes to no global Unity events. `OnDisable` detaches without touching native resources. Re-enabling or entering a new Play session requires an explicit fresh `Attach` by the owner. Do not reuse a stale source across native generations. The pump does not automatically discover or initialize plugins.
+
+### Runtime level control and typed handling
+
+An adapter may also implement `ILogLevelControl.SetPollMaxLevel`. The pump exposes **Native Max Level** in the Inspector (default Info). Inspector edits and assigning `NativeMaxLevel` are requests, applied on the main thread before the next `Drain`. Call `ApplyNativeMaxLevel()` to force application synchronously (it bypasses the per-frame applied-value cache) and inspect its status (0 applied, -3 busy/retry, -4 closed/unattached, -5 unsupported). Older sources implementing only `ILogSource` still work but cannot change the native threshold. An adapter binding an older DLL may return -5 once when its optional export is absent; the pump remembers this until reattachment, continues normal polling, and reports `SupportsNativeLevelControl == false`.
+
+This changes only the Rust polling sink. The optional file/stderr sink retains its configured `Config.max_level`; sibling Layers are unaffected. `Config.poll_max_level` optionally overrides the initial poll threshold. The convenience Dispatch rechecks a private event-only filter on its dedicated subscriber at every callsite, permits raising to Trace without rebuilding the subscriber, and disables unused spans. A host's additional global/static filters can still suppress events before this layer. Existing queued records are retained when lowering the native threshold, and can still reach handlers unless the managed threshold filters them. Queues retain oldest accepted records and drop new arrivals when full, regardless of severity.
+
+```csharp
+pump.NativeMaxLevel = LogLevel.Debug;
+if (pump.ApplyNativeMaxLevel() != 0) { /* retry busy / handle unsupported or closed */ }
+pump.DeliveryMaxLevel = LogLevel.Trace; // managed-only threshold; default Trace
+pump.Filter = record => record.Target.StartsWith("my.module");
+pump.RecordReceived += record => Handle(record.Level, record.Target, record.Message);
+pump.WriteToConsole = false; // handlers still receive records
+```
+
+`LogRecord` contains the original five-valued `LogLevel` and copied target/message strings, including embedded NUL characters. Managed threshold and predicate apply before both handlers and Console. Callbacks run synchronously on the main thread that calls `Drain`; every pump API must be used on that thread. Individual handler exceptions are isolated; a predicate exception skips that record. Reentrant Drain is ignored. Detaching stops the current delivery, and disabling/destroying clears instance handlers and the predicate, so attach and subscribe anew for the next Play session. The Inspector value is authoritative on attachment. Host-side changes require an explicit Apply or `InvalidateNativeLevel()` to reapply it. Replace native generations only while detached, then attach again. A closed control (-4) stops setting but permits final polling; busy (-3) retries without stopping polling. One native polling queue must have exactly one owning pump and level controller. Fan out using its handlers; attaching multiple pumps to the same native queue is unsupported and would split records and race threshold settings. No global handler is installed. Console text escapes NUL as `\0`.
 
 ## Lifetime and safety
 

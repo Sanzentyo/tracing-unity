@@ -46,9 +46,23 @@ fn sink_level_filter_does_not_suppress_sibling_layers() {
                 .contains("visible")
         );
         assert!(runtime.drain_record(2176).unwrap().is_none());
+        for (level, expected) in [
+            (tracing::Level::DEBUG, 2),
+            (tracing::Level::ERROR, 0),
+            (tracing::Level::TRACE, 2),
+        ] {
+            runtime.set_poll_max_level(level).unwrap();
+            let before = count.load(Ordering::Relaxed);
+            tracing::dispatcher::with_default(&dispatch, emit_pair);
+            assert_eq!(count.load(Ordering::Relaxed), before + 2);
+            for _ in 0..expected {
+                assert!(runtime.drain_record(2176).unwrap().is_some());
+            }
+            assert!(runtime.drain_record(2176).unwrap().is_none());
+        }
         runtime.shutdown().unwrap();
         tracing::dispatcher::with_default(&dispatch, emit_pair);
-        assert_eq!(count.load(Ordering::Relaxed), 4);
+        assert_eq!(count.load(Ordering::Relaxed), 10);
         assert!(runtime.drain_record(2176).unwrap().is_none());
     }
 }

@@ -19,3 +19,11 @@ Zero capacity is always a non-consuming query, including an empty payload. Raw h
 The native runtime borrows no managed buffer after a call returns. No function pointer, Rust string, trait object or tracing metadata crosses this ABI. Native owner locking, initialization and teardown are host responsibilities, not hidden global behavior in the helper.
 
 The Unity pump displays embedded NUL as the visible sequence \\0 because Unity native log strings otherwise stop at NUL.
+
+## Runtime polling threshold
+
+`Runtime::set_poll_max_level(Level)` changes polling admission only. `poll_max_level()` reads the current typed threshold. `Config::max_level` retains its file/stderr threshold and initial polling meaning; `Config::poll_max_level: Option<Level>` optionally overrides the initial polling threshold (default `None`, so the default threshold remains INFO). Existing explicit all-field `Config` literals must add the new field; literals using `..Config::default()` need no change.
+
+The borrowed helper `abi::set_poll_max_level(&Runtime, u32)` accepts 1..5 using the levels above, returning 0 on success, -1 for invalid input or poisoned state, and -4 for a closed runtime. Invalid or rejected changes leave the threshold unchanged. `abi::poll_max_level(&Runtime)` returns 1..5, also after closure. No new exported C symbol or runtime ownership is supplied by the crate.
+
+Changes are serialized with closure and queue admission. Already queued records remain available. Concurrent events may be filtered before an increase or at admission after a decrease; no replay is promised. Level filtering does not increment drop counters. Setter calls can wait for the queue mutex and belong on the control path, not inside an event formatter. The convenience dispatch keeps TRACE callsites eligible for later increases. A host-composed subscriber must likewise avoid stricter upstream/static filters if it expects dynamic increases; this library cannot override host or compile-time tracing filters. File/stderr and sibling layer thresholds are unchanged.
